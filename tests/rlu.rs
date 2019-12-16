@@ -1,7 +1,6 @@
 use rlu::{
     rlu_abort, rlu_assign_ptr, rlu_dereference, rlu_free, rlu_reader_lock, rlu_reader_unlock,
-    rlu_thread_finish, rlu_thread_init, rlu_try_lock, GlobalRlu, RluObj, RluObjHdr, RluThread,
-    WsHdr, PTR_ID_OBJ_COPY,
+    rlu_thread_init, rlu_try_lock, GlobalRlu, RluObj, RluObjHdr, RluThread, WsHdr, PTR_ID_OBJ_COPY,
 };
 use std::mem;
 use std::ptr;

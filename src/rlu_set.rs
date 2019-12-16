@@ -1,8 +1,7 @@
 use crate::concurrent_set::ConcurrentSet;
 use crate::rlu::{
     rlu_abort, rlu_assign_ptr, rlu_dereference, rlu_free, rlu_reader_lock, rlu_reader_unlock,
-    rlu_thread_finish, rlu_thread_init, rlu_try_lock, GlobalRlu, RluObj, RluObjHdr, RluThread,
-    WsHdr, PTR_ID_OBJ_COPY,
+    rlu_thread_init, rlu_try_lock, GlobalRlu, RluObj, RluObjHdr, RluThread, WsHdr, PTR_ID_OBJ_COPY,
 };
 use std::cell::Cell;
 use std::fmt::Debug;
@@ -30,15 +29,13 @@ where
             (*hdr.p_obj_actual)
                 .hdr
                 .p_obj_copy
-                .store(ptr::null_mut(), Ordering::Relaxed);
+                .store(ptr::null_mut(), Ordering::SeqCst);
         });
     }
     fn unlock(&self) {
         assert!(!self.has_ws_hdr());
         assert!(self.is_locked());
-        self.hdr
-            .p_obj_copy
-            .store(ptr::null_mut(), Ordering::Relaxed);
+        self.hdr.p_obj_copy.store(ptr::null_mut(), Ordering::SeqCst);
     }
     fn unlock_original(&self) {
         unsafe {
@@ -46,7 +43,7 @@ where
         }
     }
     fn get_p_obj_copy(&self) -> *mut Self {
-        self.hdr.p_obj_copy.load(Ordering::Relaxed)
+        self.hdr.p_obj_copy.load(Ordering::SeqCst)
     }
     fn is_locked(&self) -> bool {
         !self.get_p_obj_copy().is_null()
@@ -90,7 +87,7 @@ where
     fn cas(&self, new_obj: *mut Self) -> bool {
         self.hdr
             .p_obj_copy
-            .compare_and_swap(ptr::null_mut(), new_obj, Ordering::Relaxed)
+            .compare_and_swap(ptr::null_mut(), new_obj, Ordering::SeqCst)
             .is_null()
     }
 }
@@ -167,27 +164,27 @@ where
         let mut ret = false;
         rlu_reader_lock(self.rlu_ptr, self.thread_id);
         //println!("Contains {:?}?", value);
-        unsafe {
-            let mut node_ptr = rlu_dereference(self.rlu_ptr, self.thread_id, self.head);
-            let mut first = true;
-            loop {
-                if node_ptr.is_null() {
+        let mut node_ptr = rlu_dereference(self.rlu_ptr, self.thread_id, self.head);
+        let mut first = true;
+        loop {
+            if node_ptr.is_null() {
+                break;
+            } else if first {
+                first = false;
+                node_ptr =
+                    rlu_dereference(self.rlu_ptr, self.thread_id, unsafe { (*node_ptr).next });
+                continue;
+            } else {
+                let v = unsafe { (*node_ptr).data };
+                if v > value {
                     break;
-                } else if first {
-                    first = false;
-                    node_ptr = rlu_dereference(self.rlu_ptr, self.thread_id, (*node_ptr).next);
-                    continue;
-                } else {
-                    let v = (*node_ptr).data;
-                    if v > value {
-                        break;
-                    }
-                    if v == value {
-                        ret = true;
-                        break;
-                    }
-                    node_ptr = rlu_dereference(self.rlu_ptr, self.thread_id, (*node_ptr).next);
                 }
+                if v == value {
+                    ret = true;
+                    break;
+                }
+                node_ptr =
+                    rlu_dereference(self.rlu_ptr, self.thread_id, unsafe { (*node_ptr).next });
             }
         }
         rlu_reader_unlock(self.rlu_ptr, self.thread_id);
@@ -197,20 +194,19 @@ where
     fn len(&self) -> usize {
         let mut len = 0;
         rlu_reader_lock(self.rlu_ptr, self.thread_id);
-        unsafe {
-            let mut node_ptr = rlu_dereference(self.rlu_ptr, self.thread_id, self.head);
-            let mut first = true;
-            loop {
-                if node_ptr.is_null() {
-                    break;
+        let mut node_ptr = rlu_dereference(self.rlu_ptr, self.thread_id, self.head);
+        let mut first = true;
+        loop {
+            if node_ptr.is_null() {
+                break;
+            } else {
+                if !first {
+                    len += 1;
                 } else {
-                    if !first {
-                        len += 1;
-                    } else {
-                        first = false;
-                    }
-                    node_ptr = rlu_dereference(self.rlu_ptr, self.thread_id, (*node_ptr).next);
+                    first = false;
                 }
+                node_ptr =
+                    rlu_dereference(self.rlu_ptr, self.thread_id, unsafe { (*node_ptr).next });
             }
         }
         rlu_reader_unlock(self.rlu_ptr, self.thread_id);
@@ -219,47 +215,46 @@ where
 
     fn insert(&self, value: T) -> bool {
         loop {
-            unsafe {
-                rlu_reader_lock(self.rlu_ptr, self.thread_id);
-                let mut p_prev = rlu_dereference(self.rlu_ptr, self.thread_id, self.head);
-                let mut p_next = rlu_dereference(self.rlu_ptr, self.thread_id, (*p_prev).next);
-                let mut exact_match = false;
-                loop {
-                    if p_next.is_null() {
-                        break;
-                    }
-                    let v = (*p_next).data;
-                    if (v >= value) {
-                        if v == value {
-                            exact_match = true;
-                        }
-                        break;
-                    }
-                    p_prev = p_next;
-                    p_next = rlu_dereference(self.rlu_ptr, self.thread_id, (*p_next).next);
+            rlu_reader_lock(self.rlu_ptr, self.thread_id);
+            let mut p_prev = rlu_dereference(self.rlu_ptr, self.thread_id, self.head);
+            let mut p_next =
+                rlu_dereference(self.rlu_ptr, self.thread_id, unsafe { (*p_prev).next });
+            let mut exact_match = false;
+            loop {
+                if p_next.is_null() {
+                    break;
                 }
-                if exact_match {
-                    break; //dont insert if already in list
+                let v = unsafe { (*p_next).data };
+                if (v >= value) {
+                    if v == value {
+                        exact_match = true;
+                    }
+                    break;
                 }
-                if !rlu_try_lock(self.rlu_ptr, self.thread_id, &mut p_prev) {
+                p_prev = p_next;
+                p_next = rlu_dereference(self.rlu_ptr, self.thread_id, unsafe { (*p_next).next });
+            }
+            if exact_match {
+                break; //dont insert if already in list
+            }
+            if !rlu_try_lock(self.rlu_ptr, self.thread_id, &mut p_prev) {
+                rlu_abort(self.rlu_ptr, self.thread_id);
+                continue; //retry
+            }
+
+            if !p_next.is_null() {
+                if !rlu_try_lock(self.rlu_ptr, self.thread_id, &mut p_next) {
+                    //maybe can remove this? see gradescope
                     rlu_abort(self.rlu_ptr, self.thread_id);
                     continue; //retry
                 }
-
-                if !p_next.is_null() {
-                    if !rlu_try_lock(self.rlu_ptr, self.thread_id, &mut p_next) {
-                        //maybe can remove this? see gradescope
-                        rlu_abort(self.rlu_ptr, self.thread_id);
-                        continue; //retry
-                    }
-                }
-
-                let mut p_new_node = rlu_new_node(value);
-                // make the new node point to the current head of the list
-                rlu_assign_ptr(&mut (*p_new_node).next, p_next);
-                rlu_assign_ptr(&mut (*p_prev).next, p_new_node);
-                break;
             }
+
+            let mut p_new_node = rlu_new_node(value);
+            // make the new node point to the current head of the list
+            rlu_assign_ptr(unsafe { &mut (*p_new_node).next }, p_next);
+            rlu_assign_ptr(unsafe { &mut (*p_prev).next }, p_new_node);
+            break;
         }
         rlu_reader_unlock(self.rlu_ptr, self.thread_id);
         true
@@ -267,52 +262,54 @@ where
 
     fn delete(&self, value: T) -> bool {
         let mut ret = false;
-        unsafe {
-            let mut continue_outer = false;
+        let mut continue_outer = false;
+        loop {
+            //outer loop for restarting on failed lock
+            rlu_reader_lock(self.rlu_ptr, self.thread_id);
+            let mut p_prev = rlu_dereference(self.rlu_ptr, self.thread_id, self.head); //points to dummy head node
+            let mut p_next =
+                rlu_dereference(self.rlu_ptr, self.thread_id, unsafe { (*p_prev).next });
             loop {
-                //outer loop for restarting on failed lock
-                rlu_reader_lock(self.rlu_ptr, self.thread_id);
-                let mut p_prev = rlu_dereference(self.rlu_ptr, self.thread_id, self.head); //points to dummy head node
-                let mut p_next = rlu_dereference(self.rlu_ptr, self.thread_id, (*p_prev).next);
-                loop {
-                    if p_next.is_null() {
+                if p_next.is_null() {
+                    continue_outer = false;
+                    break;
+                } else {
+                    let v = unsafe { (*p_next).data };
+                    if v > value {
                         continue_outer = false;
                         break;
-                    } else {
-                        let v = (*p_next).data;
-                        if v > value {
-                            continue_outer = false;
-                            break;
-                        }
-                        if v == value {
-                            if !rlu_try_lock(self.rlu_ptr, self.thread_id, &mut p_prev) {
-                                rlu_abort(self.rlu_ptr, self.thread_id);
-                                continue_outer = true;
-                                break;
-                            }
-                            if !rlu_try_lock(self.rlu_ptr, self.thread_id, &mut p_next) {
-                                rlu_abort(self.rlu_ptr, self.thread_id);
-                                continue_outer = true;
-                                break;
-                            }
-                            ret = true;
-                            (*p_prev).next = (*p_next).next;
-                            rlu_free(self.rlu_ptr, self.thread_id, p_next);
-                            //let box_node = Box::from_raw(p_next);
-                            //drop(box_node);
-                            continue_outer = false;
-                            break;
-                        }
-                        p_prev = p_next;
-                        p_next = rlu_dereference(self.rlu_ptr, self.thread_id, (*p_next).next);
                     }
+                    if v == value {
+                        if !rlu_try_lock(self.rlu_ptr, self.thread_id, &mut p_prev) {
+                            rlu_abort(self.rlu_ptr, self.thread_id);
+                            continue_outer = true;
+                            break;
+                        }
+                        if !rlu_try_lock(self.rlu_ptr, self.thread_id, &mut p_next) {
+                            rlu_abort(self.rlu_ptr, self.thread_id);
+                            continue_outer = true;
+                            break;
+                        }
+                        ret = true;
+                        unsafe {
+                            (*p_prev).next = (*p_next).next;
+                        }
+                        unsafe {
+                            rlu_free(self.rlu_ptr, self.thread_id, p_next);
+                        }
+                        continue_outer = false;
+                        break;
+                    }
+                    p_prev = p_next;
+                    p_next =
+                        rlu_dereference(self.rlu_ptr, self.thread_id, unsafe { (*p_next).next });
                 }
-                if continue_outer {
-                    continue;
-                } else {
-                    rlu_reader_unlock(self.rlu_ptr, self.thread_id);
-                    break;
-                }
+            }
+            if continue_outer {
+                continue;
+            } else {
+                rlu_reader_unlock(self.rlu_ptr, self.thread_id);
+                break;
             }
         }
         ret

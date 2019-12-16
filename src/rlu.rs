@@ -256,41 +256,24 @@ where
 
 // End Rlu init/teardown functions
 
-// Begin main externally exposed RLU functions
-
-/*
-pub fn rlu_sync_and_writeback<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
+// Begin internal RLU functions
+fn rlu_process_free<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
     unsafe {
-        assert!(
-            (*rlu).threads[id]
-                .as_ref()
-                .unwrap()
-                .run_counter
-                .load(Ordering::Relaxed)
-                & 0x1
-                == 0
+        (*rlu).threads[id].as_mut().map_or_else(
+            || unreachable!(),
+            |mut box_thread| {
+                for i in 0..box_thread.free_nodes_size {
+                    let box_node = Box::from_raw(box_thread.free_nodes[i]);
+                    drop(box_node);
+                    box_thread.free_nodes[i] = ptr::null_mut();
+                }
+                box_thread.free_nodes_size = 0;
+            },
         );
     }
-    unimplemented!();
 }
 
-pub fn rlu_sync_checkpoint<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
-    unsafe {
-        if (*rlu).threads[id]
-            .as_ref()
-            .unwrap()
-            .is_sync
-            .load(Ordering::Relaxed)
-            == 0
-        {
-            return;
-        }
-    }
-    rlu_sync_and_writeback(rlu, id);
-}
-*/
-
-pub fn rlu_synchronize<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
+fn rlu_synchronize<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
     //basing mostly off paper pseudocode for now
     unsafe {
         for i in 0..RLU_MAX_THREADS {
@@ -298,14 +281,14 @@ pub fn rlu_synchronize<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
                 continue; //dont wait for myself
             }
             if (*rlu).threads[i].is_none() {
-                continue; //dont wait for uninitialized threads
+                continue; //dont wait for uninitialized/finished threads
             }
             (*rlu).threads[id].as_mut().map(|mut box_thread| {
                 box_thread.q_threads[i].run_counter = (*rlu).threads[i]
                     .as_ref()
                     .unwrap()
                     .run_counter
-                    .load(Ordering::Relaxed);
+                    .load(Ordering::SeqCst);
                 if (box_thread.q_threads[i].run_counter & 0x1 == 0x1) {
                     //if run_counter odd, wait on it
                     box_thread.q_threads[i].is_wait = true;
@@ -326,12 +309,12 @@ pub fn rlu_synchronize<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
                             .as_ref()
                             .map(|other_thread| {
                                 if box_thread.q_threads[i].run_counter
-                                    != other_thread.run_counter.load(Ordering::Relaxed)
+                                    != other_thread.run_counter.load(Ordering::SeqCst)
                                 {
                                     return true; //other thread has progressed
                                 }
-                                if box_thread.write_clock.load(Ordering::Relaxed)
-                                    <= other_thread.local_clock.load(Ordering::Relaxed)
+                                if box_thread.write_clock.load(Ordering::SeqCst)
+                                    <= other_thread.local_clock.load(Ordering::SeqCst)
                                 {
                                     return true; //other thread started after me so dont wait on it
                                 }
@@ -348,79 +331,17 @@ pub fn rlu_synchronize<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
         }
     }
 }
-pub fn rlu_thread_init<T: RluObj>(rlu: *mut GlobalRlu<T>) -> usize {
-    unsafe {
-        // safe because atomic
-        let id = (*rlu).num_threads_created.fetch_add(1, Ordering::Relaxed);
-        //println!("creating thread: {:?}", id);
-        if id >= RLU_MAX_THREADS {
-            println!("INVALID THREAD ID: {:?}, aborting", id);
-            panic!("invalid thread id");
-        }
-        //this is safe because no 2 threads will ever access the same index
-        (*rlu).threads[id] = Some(Box::new(RluThread::new(id)));
-        id
-    }
-}
 
-pub fn rlu_thread_finish<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
-    //clean up global state and drop thread
-    unsafe {
-        (*rlu).threads[id] = None;
-    }
-    //currently no support for creating thread with a given ID twice. If testing involves
-    //creating a destroying lots of threads I will fail!
-    //when is this called..?
-}
-
-pub fn rlu_reader_lock<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
-    unsafe {
-        (*rlu).threads[id].as_mut().map_or_else(
-            || unreachable!(),
-            |mut box_thread| {
-                //TODO: remove asserts for performance
-                assert!((box_thread.run_counter.load(Ordering::Relaxed) & 0x1) == 0);
-                box_thread.run_counter.fetch_add(1, Ordering::Relaxed);
-                box_thread.is_writer = false;
-                box_thread.local_clock.store(
-                    (*rlu).global_clock.load(Ordering::Relaxed),
-                    Ordering::Relaxed,
-                );
-                //TODO: C impl has a bunch of other stuff about steals and check_locks? idk
-                //C impl also does sync checkpointing here but can I just do sync with writes for
-                //less optimal impl?
-            },
-        )
-    }
-}
-
-pub fn rlu_reader_unlock<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
-    unsafe {
-        (*rlu).threads[id].as_mut().map_or_else(
-            || unreachable!(),
-            |mut box_thread| {
-                assert!((box_thread.run_counter.load(Ordering::Relaxed) & 0x1) != 0);
-                box_thread.run_counter.fetch_add(1, Ordering::Relaxed);
-                if box_thread.is_writer {
-                    box_thread.is_writer = false;
-                    //println!("calling commit write log");
-                    rlu_commit_write_log(rlu, id);
-                }
-            },
-        )
-    }
-}
-
-pub fn rlu_commit_write_log<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
+fn rlu_commit_write_log<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
     unsafe {
         (*rlu).threads[id].as_mut().map_or_else(
             || unreachable!(),
             |mut box_thread| {
                 box_thread.write_clock.store(
-                    (*rlu).global_clock.load(Ordering::Relaxed) + 1,
-                    Ordering::Relaxed,
+                    (*rlu).global_clock.load(Ordering::SeqCst) + 1,
+                    Ordering::SeqCst,
                 );
-                (*rlu).global_clock.fetch_add(1, Ordering::Relaxed);
+                (*rlu).global_clock.fetch_add(1, Ordering::SeqCst);
             },
         );
     }
@@ -433,7 +354,7 @@ pub fn rlu_commit_write_log<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
             |mut box_thread| {
                 box_thread
                     .write_clock
-                    .store(std::u64::MAX, Ordering::Relaxed);
+                    .store(std::u64::MAX, Ordering::SeqCst);
             },
         );
     }
@@ -441,7 +362,7 @@ pub fn rlu_commit_write_log<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
     rlu_process_free(rlu, id);
 }
 
-pub fn rlu_writeback_write_log<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
+fn rlu_writeback_write_log<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
     unsafe {
         (*rlu).threads[id].as_mut().map_or_else(
             || unreachable!(),
@@ -459,7 +380,7 @@ pub fn rlu_writeback_write_log<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
     }
 }
 
-pub fn rlu_swap_write_logs<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
+fn rlu_swap_write_logs<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
     unsafe {
         (*rlu).threads[id].as_mut().map_or_else(
             || unreachable!(),
@@ -470,13 +391,6 @@ pub fn rlu_swap_write_logs<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
                 if cur_pos < (RLU_MAX_LOG_SIZE / 2) {
                     for i in (RLU_MAX_LOG_SIZE / 2)..RLU_MAX_LOG_SIZE {
                         if box_thread.wlog.buffer[i].is_some() {
-                            /*
-                            println!(
-                                "Erasing obj at index: {:?} @ addr {:p}",
-                                i,
-                                &(box_thread.wlog.buffer[i].as_ref().unwrap())
-                            );
-                            */
                             box_thread.wlog.buffer[i] = None; //no readers can remain for these entries
                         }
                     }
@@ -484,12 +398,6 @@ pub fn rlu_swap_write_logs<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
                 } else {
                     for i in 0..(RLU_MAX_LOG_SIZE / 2) {
                         if box_thread.wlog.buffer[i].is_some() {
-                            /*
-                            println!(
-                                "Erasing obj at index: {:?} @ addr {:p}",
-                                i,
-                                &(box_thread.wlog.buffer[i].as_ref().unwrap())
-                            );*/
                             box_thread.wlog.buffer[i] = None; //no readers can remain for these entries
                         }
                     }
@@ -497,6 +405,74 @@ pub fn rlu_swap_write_logs<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
                 }
             },
         );
+    }
+}
+
+fn rlu_unlock_objs<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
+    unsafe {
+        (*rlu).threads[id].as_mut().map_or_else(
+            || unreachable!(),
+            |mut box_thread| {
+                for i in
+                    (box_thread.wlog.cur_pos - box_thread.wlog.num_of_objs)..box_thread.wlog.cur_pos
+                {
+                    assert!(box_thread.wlog.buffer[i].is_some());
+                    box_thread.wlog.buffer[i]
+                        .as_ref()
+                        .map(|ws_copy| (*ws_copy).unlock_original());
+                }
+                box_thread.wlog.cur_pos -= box_thread.wlog.num_of_objs;
+                box_thread.wlog.num_of_objs = 0;
+            },
+        )
+    }
+}
+// End internal RLU functions
+
+// Begin main externally exposed RLU functions
+
+pub fn rlu_thread_init<T: RluObj>(rlu: *mut GlobalRlu<T>) -> usize {
+    unsafe {
+        let id = (*rlu).num_threads_created.fetch_add(1, Ordering::SeqCst);
+        if id >= RLU_MAX_THREADS {
+            panic!("invalid thread id");
+        }
+        //this is safe because no 2 threads will ever access the same index
+        assert!((*rlu).threads[id].is_none());
+        (*rlu).threads[id] = Some(Box::new(RluThread::new(id)));
+        id
+    }
+}
+
+pub fn rlu_reader_lock<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
+    unsafe {
+        (*rlu).threads[id].as_mut().map_or_else(
+            || unreachable!(),
+            |mut box_thread| {
+                assert!((box_thread.run_counter.load(Ordering::SeqCst) & 0x1) == 0);
+                box_thread.run_counter.fetch_add(1, Ordering::SeqCst);
+                box_thread.is_writer = false;
+                box_thread
+                    .local_clock
+                    .store((*rlu).global_clock.load(Ordering::SeqCst), Ordering::SeqCst);
+            },
+        )
+    }
+}
+
+pub fn rlu_reader_unlock<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
+    unsafe {
+        (*rlu).threads[id].as_mut().map_or_else(
+            || unreachable!(),
+            |mut box_thread| {
+                assert!((box_thread.run_counter.load(Ordering::SeqCst) & 0x1) != 0);
+                box_thread.run_counter.fetch_add(1, Ordering::SeqCst);
+                if box_thread.is_writer {
+                    box_thread.is_writer = false;
+                    rlu_commit_write_log(rlu, id);
+                }
+            },
+        )
     }
 }
 
@@ -518,27 +494,21 @@ pub fn rlu_dereference<T: RluObj>(
         }
         if p_obj_copy == mem::transmute(PTR_ID_OBJ_COPY) {
             // this is already a copy, it has already been referenced
-            //println!("DEREF: Already a copy");
             return p_obj;
         }
 
-        //println!("pre-assert1 p_obj: {:p}", p_obj);
         let locking_thread = (*p_obj_copy).get_locking_thread_from_ws_obj();
-        if locking_thread > RLU_MAX_THREADS {
-            //println!("Bad thread id from copy @: {:p}", p_obj_copy);
-        }
-        //println!("Good thread id from copy @: {:p}", p_obj_copy);
         if locking_thread == id {
             //locked by us!
             return p_obj_copy;
         }
         let other_write_clock = (*rlu).threads[locking_thread].as_ref().map_or_else(
             || unreachable!(),
-            |other_thread| other_thread.write_clock.load(Ordering::Relaxed),
+            |other_thread| other_thread.write_clock.load(Ordering::SeqCst),
         );
         let my_local_clock = (*rlu).threads[id].as_ref().map_or_else(
             || unreachable!(),
-            |box_thread| box_thread.local_clock.load(Ordering::Relaxed),
+            |box_thread| box_thread.local_clock.load(Ordering::SeqCst),
         );
         if other_write_clock <= my_local_clock {
             p_obj_copy //steal!
@@ -562,58 +532,32 @@ pub fn rlu_try_lock<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize, p_p_obj: *mut 
         );
         let mut p_obj_copy = (*p_obj).get_p_obj_copy();
         if p_obj_copy == mem::transmute(PTR_ID_OBJ_COPY) {
-            //is_copy
             //tried to lock a copy!
             //get original
-            //println!("getting original from copy");
             assert!((*p_obj).has_ws_hdr());
-            //println!("Before getting original: {:p}", p_obj);
             p_obj = (*p_obj).get_p_original();
             p_obj_copy = (*p_obj).get_p_obj_copy();
-            //println!("After getting original: {:p}", p_obj);
         }
 
         if !p_obj_copy.is_null() {
-            //is locked
-            //println!("original is locked");
             // object already locked!
-            //println!("pre-assert2 p_obj: {:p}", p_obj);
             let th_id = (*p_obj_copy).get_locking_thread_from_ws_obj();
             if th_id == id {
                 //check run counter to see if locked by current execution of this thread
                 if (*p_obj_copy).get_ws_run_counter()
                     == (*rlu).threads[id]
                         .as_ref()
-                        .map(|thread| thread.run_counter.load(Ordering::Relaxed))
+                        .map(|thread| thread.run_counter.load(Ordering::SeqCst))
                         .unwrap()
                 {
                     // already locked by current execution of this thread
-                    // how would this happen..? Aborting on second lock?
                     *p_p_obj = p_obj_copy;
                     return true;
                 }
                 //locked by other execution of this thread
-                /*
-                (*rlu).threads[id].as_mut().map_or_else(
-                    || unreachable!(),
-                    |mut box_thread| box_thread.is_sync.fetch_add(1, Ordering::Relaxed),
-                );
-                */
-                //println!("locked by other execution of this thread");
                 return false;
             }
             // locked by another thread
-            // next line == send_sync_response (TODO: May need different Ordering?)
-            /*
-            (*rlu).threads[th_id].as_mut().map_or_else(
-                || unreachable!(),
-                |mut box_thread| box_thread.is_sync.fetch_add(1, Ordering::Relaxed),
-            );
-            (*rlu).threads[id].as_mut().map_or_else(
-                || unreachable!(),
-                |mut box_thread| box_thread.is_sync.fetch_add(1, Ordering::Relaxed),
-            );
-            */
             return false;
         }
         //unlocked!
@@ -626,26 +570,22 @@ pub fn rlu_try_lock<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize, p_p_obj: *mut 
                 }
             },
         );
-        //println!("creating copy with th_id: {:?}", id);
         let obj_copy = (*rlu).threads[id].as_mut().map_or_else(
             || unreachable!(),
             |mut box_thread| {
                 box_thread.wlog.buffer[box_thread.wlog.cur_pos] = Some(
                     (*p_obj)
-                        .get_copy_with_ws_hdr(box_thread.run_counter.load(Ordering::Relaxed), id),
+                        .get_copy_with_ws_hdr(box_thread.run_counter.load(Ordering::SeqCst), id),
                 );
                 box_thread.wlog.buffer[box_thread.wlog.cur_pos]
                     .as_mut()
                     .unwrap()
-                //TODO: move load() call?
-                //TODO: This seems like it shouldnt work I am a hack
             },
         );
         // My design here differs slightly from the C implementation, in that it puts the entire
         // copy in the write log before trying to compare-and-swap the pointer in the original.
 
         if !(*p_obj).cas(obj_copy) {
-            //println!("CAS failed");
             return false;
         }
 
@@ -664,68 +604,24 @@ pub fn rlu_try_lock<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize, p_p_obj: *mut 
     }
 }
 
-pub fn rlu_unlock_objs<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
-    unsafe {
-        (*rlu).threads[id].as_mut().map_or_else(
-            || unreachable!(),
-            |mut box_thread| {
-                for i in
-                    (box_thread.wlog.cur_pos - box_thread.wlog.num_of_objs)..box_thread.wlog.cur_pos
-                {
-                    assert!(box_thread.wlog.buffer[i].is_some());
-                    box_thread.wlog.buffer[i]
-                        .as_ref()
-                        .map(|ws_copy| (*ws_copy).unlock_original());
-                    //box_thread.wlog.buffer[i] = None; //TODO: Is this right, this is a late
-                    //change
-                }
-                box_thread.wlog.cur_pos -= box_thread.wlog.num_of_objs;
-                box_thread.wlog.num_of_objs = 0;
-            },
-        )
-    }
-}
-
 pub fn rlu_abort<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
     unsafe {
         (*rlu).threads[id].as_mut().map_or_else(
             || unreachable!(),
             |mut box_thread| {
-                let prev = box_thread.run_counter.fetch_add(1, Ordering::Relaxed);
+                let prev = box_thread.run_counter.fetch_add(1, Ordering::SeqCst);
                 assert!((prev & 0x1) != 0);
                 if box_thread.is_writer {
                     box_thread.is_writer = false;
                     rlu_unlock_objs(rlu, id);
-                    //TODO: release locks
                 }
             },
         )
     }
 }
 
-pub fn rlu_process_free<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
-    unsafe {
-        (*rlu).threads[id].as_mut().map_or_else(
-            || unreachable!(),
-            |mut box_thread| {
-                for i in 0..box_thread.free_nodes_size {
-                    let box_node = Box::from_raw(box_thread.free_nodes[i]);
-                    drop(box_node);
-                    box_thread.free_nodes[i] = ptr::null_mut();
-                }
-                box_thread.free_nodes_size = 0;
-            },
-        );
-    }
-}
-
 pub unsafe fn rlu_free<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize, p_obj: *mut T) {
     assert!((*p_obj).is_copy()); //cant free node you havent locked!
-                                 /*
-                                 (*rlu).threads[id].as_mut().map_or_else(|| unreachable!(), |mut box_thread| {
-                                     box_thread.wlog.buffer[???] = None?
-                                 });
-                                 */
 
     (*rlu).threads[id].as_mut().map_or_else(
         || unreachable!(),
