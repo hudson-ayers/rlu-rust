@@ -14,8 +14,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 pub struct Node<T: 'static + Clone> {
     hdr: RluObjHdr<Node<T>>,
     next: NodePtr<T>,
-    data: Option<T>, //only way I can think of to make first node a dummy node :/
-                     // unless maybe I initialize it with  mem::maybeuninit for the dummy..?
+    data: T,
 }
 type NodePtr<T> = *mut Node<T>;
 
@@ -112,7 +111,7 @@ pub fn rlu_new_node<T: Clone>(value: T) -> *mut Node<T> {
             ws_hdr: None,
         },
         next: ptr::null_mut(),
-        data: Some(value),
+        data: value,
     });
 
     let tmp = Box::into_raw(node);
@@ -134,7 +133,7 @@ where
                     ws_hdr: None,
                 },
                 next: ptr::null_mut(),
-                data: None,
+                data: unsafe { mem::MaybeUninit::zeroed().assume_init() }, // Okay bc this value will never be accessed
             })),
             thread_id: thread_id,
         }
@@ -150,7 +149,7 @@ where
                 if node_ptr.is_null() {
                     break;
                 } else {
-                    ret.push_str(&format!("{:?}, ", (*node_ptr).data.unwrap()));
+                    ret.push_str(&format!("{:?}, ", (*node_ptr).data));
                     node_ptr = (*node_ptr).next;
                 }
             }
@@ -179,7 +178,7 @@ where
                     node_ptr = rlu_dereference(self.rlu_ptr, self.thread_id, (*node_ptr).next);
                     continue;
                 } else {
-                    let v = (*node_ptr).data.unwrap();
+                    let v = (*node_ptr).data;
                     if v > value {
                         break;
                     }
@@ -229,7 +228,7 @@ where
                     if p_next.is_null() {
                         break;
                     }
-                    let v = (*p_next).data.unwrap();
+                    let v = (*p_next).data;
                     if (v >= value) {
                         if v == value {
                             exact_match = true;
@@ -280,7 +279,7 @@ where
                         continue_outer = false;
                         break;
                     } else {
-                        let v = (*p_next).data.unwrap();
+                        let v = (*p_next).data;
                         if v > value {
                             continue_outer = false;
                             break;
