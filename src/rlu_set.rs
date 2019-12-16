@@ -1,11 +1,9 @@
 use crate::concurrent_set::ConcurrentSet;
 use crate::rlu::{
     rlu_abort, rlu_assign_ptr, rlu_dereference, rlu_free, rlu_reader_lock, rlu_reader_unlock,
-    rlu_thread_init, rlu_try_lock, GlobalRlu, RluObj, RluObjHdr, RluThread, WsHdr, PTR_ID_OBJ_COPY,
+    rlu_thread_init, rlu_try_lock, GlobalRlu, RluObj, RluObjHdr, WsHdr, PTR_ID_OBJ_COPY,
 };
-use std::cell::Cell;
 use std::fmt::Debug;
-use std::marker::{PhantomData, Unpin};
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
@@ -117,7 +115,7 @@ pub fn rlu_new_node<T: Clone>(value: T) -> *mut Node<T> {
 
 impl<T> RluSet<T>
 where
-    T: PartialEq + PartialOrd + Copy + Clone + Debug + Unpin,
+    T: PartialEq + PartialOrd + Copy + Clone + Debug,
 {
     pub fn new() -> RluSet<T> {
         let rlu_ptr: *mut GlobalRlu<Node<T>> = GlobalRlu::init_rlu();
@@ -225,7 +223,7 @@ where
                     break;
                 }
                 let v = unsafe { (*p_next).data };
-                if (v >= value) {
+                if v >= value {
                     if v == value {
                         exact_match = true;
                     }
@@ -250,7 +248,7 @@ where
                 }
             }
 
-            let mut p_new_node = rlu_new_node(value);
+            let p_new_node = rlu_new_node(value);
             // make the new node point to the current head of the list
             rlu_assign_ptr(unsafe { &mut (*p_new_node).next }, p_next);
             rlu_assign_ptr(unsafe { &mut (*p_prev).next }, p_new_node);
@@ -262,8 +260,8 @@ where
 
     fn delete(&self, value: T) -> bool {
         let mut ret = false;
-        let mut continue_outer = false;
         loop {
+            let mut continue_outer = false;
             //outer loop for restarting on failed lock
             rlu_reader_lock(self.rlu_ptr, self.thread_id);
             let mut p_prev = rlu_dereference(self.rlu_ptr, self.thread_id, self.head); //points to dummy head node
@@ -271,12 +269,10 @@ where
                 rlu_dereference(self.rlu_ptr, self.thread_id, unsafe { (*p_prev).next });
             loop {
                 if p_next.is_null() {
-                    continue_outer = false;
                     break;
                 } else {
                     let v = unsafe { (*p_next).data };
                     if v > value {
-                        continue_outer = false;
                         break;
                     }
                     if v == value {
@@ -297,7 +293,6 @@ where
                         unsafe {
                             rlu_free(self.rlu_ptr, self.thread_id, p_next);
                         }
-                        continue_outer = false;
                         break;
                     }
                     p_prev = p_next;

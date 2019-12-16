@@ -1,4 +1,3 @@
-use std::marker::{PhantomData, Unpin};
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
@@ -28,8 +27,6 @@ where
         ObjList {
             num_of_objs: 0,
             cur_pos: 0,
-            // Rust array initialization is so stupid. It's mind boggling there isn't a clean way to
-            // initialize large arrays where the internal type is not copy.
             buffer: [
                 None, None, None, None, None, None, None, None, None, None, None, None, None, None,
                 None, None, None, None, None, None, None, None, None, None, None, None, None, None,
@@ -53,14 +50,11 @@ pub struct WaitEntry {
 }
 
 pub struct RluThread<T: RluObj> {
-    uniq_id: usize,
     is_writer: bool,
     wlog: ObjList<T>,
     run_counter: AtomicU64, //odd = active, even = inactive
     local_clock: AtomicU64,
     write_clock: AtomicU64,
-    is_write_detected: bool,
-    is_check_locks: bool,                    // no idea what u are
     q_threads: [WaitEntry; RLU_MAX_THREADS], //pre-allocated storage for checking thread status
     free_nodes: [*mut T; RLU_MAX_FREE_NODES],
     free_nodes_size: usize,
@@ -70,16 +64,13 @@ impl<T> RluThread<T>
 where
     T: RluObj,
 {
-    pub fn new(id: usize) -> RluThread<T> {
+    pub fn new() -> RluThread<T> {
         RluThread {
-            uniq_id: id,
             is_writer: false,
             wlog: ObjList::new(),
             run_counter: AtomicU64::new(0),
             local_clock: AtomicU64::new(0),
             write_clock: AtomicU64::new(std::u64::MAX),
-            is_write_detected: false,
-            is_check_locks: false,
             q_threads: [WaitEntry {
                 is_wait: false,
                 run_counter: 0,
@@ -240,7 +231,7 @@ where
         }
     }
     pub fn init_rlu() -> *mut GlobalRlu<T> {
-        let mut boxed = Box::new(GlobalRlu::new());
+        let boxed = Box::new(GlobalRlu::new());
         Box::into_raw(boxed)
     }
 }
@@ -280,7 +271,7 @@ fn rlu_synchronize<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
                     .unwrap()
                     .run_counter
                     .load(Ordering::SeqCst);
-                if (box_thread.q_threads[i].run_counter & 0x1 == 0x1) {
+                if box_thread.q_threads[i].run_counter & 0x1 == 0x1 {
                     //if run_counter odd, wait on it
                     box_thread.q_threads[i].is_wait = true;
                 } else {
@@ -292,7 +283,7 @@ fn rlu_synchronize<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
             loop {
                 let done = (*rlu).threads[id]
                     .as_mut()
-                    .map(|mut box_thread| {
+                    .map(|box_thread| {
                         if !box_thread.q_threads[i].is_wait {
                             return true; //already confirmed I dont need to wait
                         }
@@ -327,7 +318,7 @@ fn rlu_commit_write_log<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
     unsafe {
         (*rlu).threads[id].as_mut().map_or_else(
             || unreachable!(),
-            |mut box_thread| {
+            |box_thread| {
                 box_thread.write_clock.store(
                     (*rlu).global_clock.load(Ordering::SeqCst) + 1,
                     Ordering::SeqCst,
@@ -342,7 +333,7 @@ fn rlu_commit_write_log<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
     unsafe {
         (*rlu).threads[id].as_mut().map_or_else(
             || unreachable!(),
-            |mut box_thread| {
+            |box_thread| {
                 box_thread
                     .write_clock
                     .store(std::u64::MAX, Ordering::SeqCst);
@@ -385,7 +376,7 @@ fn rlu_swap_write_logs<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize) {
                             box_thread.wlog.buffer[i] = None; //no readers can remain for these entries
                         }
                     }
-                    box_thread.wlog.cur_pos = (RLU_MAX_LOG_SIZE / 2); //swaps write logs
+                    box_thread.wlog.cur_pos = RLU_MAX_LOG_SIZE / 2; //swaps write logs
                 } else {
                     for i in 0..(RLU_MAX_LOG_SIZE / 2) {
                         if box_thread.wlog.buffer[i].is_some() {
@@ -430,7 +421,7 @@ pub fn rlu_thread_init<T: RluObj>(rlu: *mut GlobalRlu<T>) -> usize {
         }
         //this is safe because no 2 threads will ever access the same index
         assert!((*rlu).threads[id].is_none());
-        (*rlu).threads[id] = Some(Box::new(RluThread::new(id)));
+        (*rlu).threads[id] = Some(Box::new(RluThread::new()));
         id
     }
 }
@@ -511,7 +502,7 @@ pub fn rlu_dereference<T: RluObj>(
 
 pub fn rlu_try_lock<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize, p_p_obj: *mut *mut T) -> bool {
     unsafe {
-        let mut p_obj = (*p_p_obj);
+        let mut p_obj = *p_p_obj;
 
         assert!(!p_obj.is_null()); // cant lock null pointer!
 
@@ -552,15 +543,6 @@ pub fn rlu_try_lock<T: RluObj>(rlu: *mut GlobalRlu<T>, id: usize, p_p_obj: *mut 
             return false;
         }
         //unlocked!
-        (*rlu).threads[id].as_mut().map_or_else(
-            || unreachable!(),
-            |mut box_thread| {
-                if !box_thread.is_write_detected {
-                    box_thread.is_write_detected = true;
-                    box_thread.is_check_locks = true;
-                }
-            },
-        );
         let obj_copy = (*rlu).threads[id].as_mut().map_or_else(
             || unreachable!(),
             |mut box_thread| {
