@@ -3,18 +3,10 @@ use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-// Some handy constants if you want fixed-size arrays of the relevant constructs.
 const RLU_MAX_LOG_SIZE: usize = 128;
 const RLU_MAX_THREADS: usize = 32;
 const RLU_MAX_FREE_NODES: usize = 100;
 pub const PTR_ID_OBJ_COPY: usize = 0x12341234;
-
-const RLU_MAX_NESTED_WRITER_LOCKS: usize = 20;
-
-pub struct WriterLocks {
-    size: i64,
-    ids: [i64; RLU_MAX_NESTED_WRITER_LOCKS],
-}
 
 pub struct WsHdr<T: RluObj> {
     pub p_obj_actual: *mut T,
@@ -23,7 +15,6 @@ pub struct WsHdr<T: RluObj> {
 }
 
 pub struct ObjList<T: RluObj> {
-    //writer_locks: WriterLocks; //should this just be a pointer to global writer locks array?
     num_of_objs: usize,
     cur_pos: usize,
     buffer: [Option<T>; RLU_MAX_LOG_SIZE],
