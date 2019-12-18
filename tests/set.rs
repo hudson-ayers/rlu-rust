@@ -1,3 +1,5 @@
+// Author: Will Crichton, Edits by Hudson Ayers
+
 extern crate rand;
 
 use rlu::{ConcurrentSet, RluSet};

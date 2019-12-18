@@ -1,3 +1,5 @@
+// Author: Hudson Ayers
+
 use std::mem;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};

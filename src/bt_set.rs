@@ -1,3 +1,5 @@
+// Author: Will Crichton
+
 use crate::concurrent_set::ConcurrentSet;
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};

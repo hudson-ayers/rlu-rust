@@ -1,3 +1,5 @@
+// Author: Hudson Ayers
+
 use crate::concurrent_set::ConcurrentSet;
 use crate::rlu::{
     rlu_abort, rlu_assign_ptr, rlu_dereference, rlu_free, rlu_reader_lock, rlu_reader_unlock,
